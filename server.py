@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -13,8 +15,19 @@ from pydantic import BaseModel, Field
 from agent import DealforgeError, generate_fal_blueprint_with_notes
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+logging.getLogger("google_genai._api_client").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = FastAPI(title="Dealforge", docs_url=None, redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():

@@ -139,9 +139,16 @@ generateBtn.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ client_email: text }),
     });
-    const data = await res.json();
+    let data;
+    const contentType = res.headers.get("content-type") || "";
+    try {
+      data = contentType.includes("application/json") ? await res.json() : { detail: await res.text() || "Request failed" };
+    } catch (_) {
+      data = { detail: res.statusText || "Request failed" };
+    }
     if (!res.ok) {
-      showMessage(data.detail || "Request failed");
+      const msg = Array.isArray(data.detail) ? data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ") : (data.detail || "Request failed");
+      showMessage(msg);
       return;
     }
     showResult(data);

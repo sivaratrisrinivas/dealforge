@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import List
 
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 from dotenv import load_dotenv
+from chromadb.config import Settings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,15 +21,17 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from pydantic import BaseModel, Field
 
 CHROMA_COLLECTION = "dealforge_docs"
-# Default to flash for latency; set DEALFORGE_CHAT_MODEL=gemini-2.5-pro for max quality
+DEFAULT_FAST_CHAT_MODEL = "gemini-3-flash-preview"
 DEFAULT_CHAT_MODEL = "gemini-2.5-pro"
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 DEFAULT_CHROMA_DIR = "chroma_db"
 RETRIEVAL_K = 3  # Fewer chunks = smaller context, faster LLM
 MAX_GENERATION_ATTEMPTS = 3
+RESULT_CACHE_SIZE = 128
 
 _vector_store: Chroma | None = None
-_llm: ChatGoogleGenerativeAI | None = None
+_llms: dict[str, ChatGoogleGenerativeAI] = {}
+_result_cache: OrderedDict[str, BlueprintResult] = OrderedDict()
 
 SYSTEM_PROMPT = """You are an elite Forward Deployed Engineer at Fal.ai.
 You read client emails and generate exact, flawless Python scripts using fal.App and DistributedRunner.
@@ -113,21 +120,55 @@ def _build_vector_store() -> Chroma:
         collection_name=CHROMA_COLLECTION,
         persist_directory=str(chroma_dir),
         embedding_function=embeddings,
+        client_settings=Settings(
+            anonymized_telemetry=False,
+            chroma_product_telemetry_impl="dealforge_chroma.NoOpProductTelemetry",
+        ),
     )
     return _vector_store
 
 
-def _build_llm() -> ChatGoogleGenerativeAI:
-    global _llm
-    if _llm is not None:
-        return _llm
-    chat_model = os.getenv("DEALFORGE_CHAT_MODEL", DEFAULT_CHAT_MODEL)
-    _llm = ChatGoogleGenerativeAI(
-        model=chat_model,
+def _build_llm(model_name: str) -> ChatGoogleGenerativeAI:
+    llm = _llms.get(model_name)
+    if llm is not None:
+        return llm
+    llm = ChatGoogleGenerativeAI(
+        model=model_name,
         temperature=0.2,
         google_api_key=_get_google_api_key(),
     )
-    return _llm
+    _llms[model_name] = llm
+    return llm
+
+
+def _candidate_models() -> list[str]:
+    primary = os.getenv("DEALFORGE_FAST_CHAT_MODEL", DEFAULT_FAST_CHAT_MODEL)
+    fallback = os.getenv("DEALFORGE_CHAT_MODEL", DEFAULT_CHAT_MODEL)
+    if primary == fallback:
+        return [primary]
+    return [primary, fallback]
+
+
+def _cache_key(client_email: str) -> str:
+    normalized = re.sub(r"\s+", " ", client_email.strip())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _get_cached_result(client_email: str) -> BlueprintResult | None:
+    key = _cache_key(client_email)
+    result = _result_cache.get(key)
+    if result is None:
+        return None
+    _result_cache.move_to_end(key)
+    return result
+
+
+def _store_cached_result(client_email: str, result: BlueprintResult) -> None:
+    key = _cache_key(client_email)
+    _result_cache[key] = result
+    _result_cache.move_to_end(key)
+    while len(_result_cache) > RESULT_CACHE_SIZE:
+        _result_cache.popitem(last=False)
 
 
 def _format_docs(documents: List[Document]) -> str:
@@ -241,8 +282,13 @@ def _validate_fal_contract(code: str) -> None:
         )
 
 
-def _invoke_generation(client_email: str, context: str, feedback: str | None = None) -> BlueprintResult:
-    llm = _build_llm()
+def _invoke_generation(
+    client_email: str,
+    context: str,
+    model_name: str,
+    feedback: str | None = None,
+) -> BlueprintResult:
+    llm = _build_llm(model_name)
 
     human_prompt = f"""Client email:
 {client_email}
@@ -279,29 +325,39 @@ Requirements:
 
 def generate_fal_blueprint_with_notes(client_email: str) -> BlueprintResult:
     """Generate a validated blueprint and a short explanation for the UI."""
-
     load_dotenv(dotenv_path=_project_root() / ".env")
 
     if not client_email or not client_email.strip():
         raise DealforgeError("Client requirements cannot be empty.")
 
+    cached_result = _get_cached_result(client_email)
+    if cached_result is not None:
+        return cached_result
+
     _get_google_api_key()
     documents = _retrieve_context(client_email)
     context = _format_docs(documents)
+    model_candidates = _candidate_models()
 
     last_error = None
-    for _ in range(MAX_GENERATION_ATTEMPTS):
-        result = _invoke_generation(client_email=client_email.strip(), context=context, feedback=last_error)
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
+        model_name = model_candidates[min(attempt, len(model_candidates) - 1)]
+        result = _invoke_generation(
+            client_email=client_email.strip(),
+            context=context,
+            model_name=model_name,
+            feedback=last_error,
+        )
         try:
             _validate_python(result.code)
             _validate_fal_contract(result.code)
+            _store_cached_result(client_email, result)
             return result
         except DealforgeError as exc:
             last_error = str(exc)
-
     raise DealforgeError(
         "The model repeatedly produced invalid Python after AST validation retries. "
-        "Please try again with more specific requirements."
+        "Try again or rephrase your requirements; you can also use the sample request and then edit it."
     )
 
 

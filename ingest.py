@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 
+# Disable Chroma telemetry in build/runtime ingestion paths.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 from dotenv import load_dotenv
+from chromadb.config import Settings
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -15,6 +20,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 CHROMA_COLLECTION = "dealforge_docs"
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 DEFAULT_DOCS_DIR = "fal_docs"
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+logging.getLogger("google_genai._api_client").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _require_env(var_name: str) -> str:
@@ -67,6 +78,10 @@ def ingest_documents() -> None:
         embedding=embeddings,
         collection_name=CHROMA_COLLECTION,
         persist_directory=str(chroma_dir),
+        client_settings=Settings(
+            anonymized_telemetry=False,
+            chroma_product_telemetry_impl="dealforge_chroma.NoOpProductTelemetry",
+        ),
     )
 
     count = vector_store._collection.count()
